@@ -6,6 +6,8 @@ Hard stop: To keep readable for newcomers, let's make sure `train_gpt.py` and `t
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+from typing import Optional, List, Tuple
 import copy
 import glob
 import io
@@ -422,6 +424,428 @@ def dequantize_state_dict_int8(obj: dict[str, object]) -> dict[str, Tensor]:
     return out
 
 
+# -----------------------------
+# GPT Q
+# -----------------------------
+
+@dataclass
+class GPTQConfig:
+    bits: int = 4
+    blocksize: int = 128
+    perchannel: bool = True
+    sym: bool = True
+    group_size: int = 128
+    damp_percent: float = 0.01
+    actorder: bool = False          # Hessian diag 큰 순으로 재정렬
+    true_sequential: bool = True    # column 순차 보정
+    keep_fp32_names: tuple[str, ...] = (
+        "attn_scale",
+        "attn_scales",
+        "mlp_scale",
+        "mlp_scales",
+        "resid_mix",
+        "resid_mixes",
+        "q_gain",
+        "skip_weight",
+        "skip_weights",
+    )
+    max_passthrough_numel: int = 65_536
+
+class SimpleQuantizer:
+    def __init__(self, bits: int = 4, sym: bool = True):
+        self.bits = bits
+        self.sym = sym
+        self.maxq = 2**bits -1
+
+    def find_params(self, W: Tensor, weigh: bool = True) -> tuple[Tensor, Tensor]:
+        if W.ndim == 1:
+                W = W.unsqueeze(1)
+        device = W.device
+        Wf = W.float()
+
+        if self.sym:
+            xmax = Wf.abs().amax(dim=1, keepdim=True)
+            scale = xmax / max((self.maxq // 2), 1)
+            scale = torch.clamp(scale, min=1e-8)
+            zero = torch.zeros_like(scale, device=device)
+        else:
+            wmin = Wf.amin(dim=1, keepdim=True)
+            wmax = Wf.amax(dim=1, keepdim=True)
+            scale = (wmax - wmin) / max(self.maxq, 1)
+            scale = torch.clamp(scale, min=1e-8)
+            zero = torch.round(-wmin / scale).clamp(0, self.maxq)
+
+        return scale, zero
+    
+    def quantize(self, W: Tensor, scale: Tensor, zero: Tensor) -> Tensor:
+        Wf = W.float()
+        if self.sym:
+            q = torch.round(Wf / scale)
+            qmin = -(self.maxq // 2)
+            qmax = self.maxq // 2
+            q = q.clamp(qmin, qmax)
+            deq = q * scale
+        else:
+            q = torch.round(Wf / scale + zero).clamp(0, self.maxq)
+            deq = (q - zero) * scale
+        return deq.to(W.dtype)
+    
+class HessianAccumulator:
+    def __init__(self, columns: int, device: torch.device):
+        self.columns = columns
+        self.device = device
+        self.H = torch.zeros((columns, columns), dtype=torch.float64, device=device)
+        self.nsamples = 0
+
+    @torch.no_grad()
+    def add_batch(self, x: Tensor) -> None:
+        """
+        x: [B, T, C] 또는 [N, C]
+        linear input으로 들어오는 activation
+        """
+        if x.ndim == 3:
+            x = x.reshape(-1, x.shape[-1])
+        elif x.ndim != 2:
+            raise ValueError(f"Expected 2D or 3D input, got shape={tuple(x.shape)}")
+
+        x = x.to(device=self.device, dtype=torch.float32)
+        self.H += x.t().double() @ x.double()
+        self.nsamples += x.shape[0]
+
+    def get(self) -> Tensor:
+        return self.H
+        
+class GPTQLayerQuantizer:
+    def __init__(self, layer: nn.Module, config: GPTQConfig):
+        if not hasattr(layer, "weight"):
+            raise TypeError("GPTQLayerQuantizer expects a module with .weight")
+
+        self.layer = layer
+        self.config = config
+        self.weight = layer.weight.detach()
+        self.device = self.weight.device
+        self.rows, self.columns = self.weight.shape
+        self.hessian_acc = HessianAccumulator(self.columns, self.device)
+
+    @torch.no_grad()
+    def add_batch(self, inp: Tensor) -> None:
+        self.hessian_acc.add_batch(inp)
+
+    @torch.no_grad()
+    def _prepare_hessian(self) -> Tensor:
+        H = self.hessian_acc.get().clone().float()
+
+        # 죽은 column 방지
+        dead = torch.diag(H) == 0
+        H[dead, dead] = 1.0
+
+        # damping
+        damp = self.config.damp_percent * torch.mean(torch.diag(H))
+        diag = torch.arange(self.columns, device=H.device)
+        H[diag, diag] += damp
+
+        return H
+
+    @torch.no_grad()
+    def _maybe_actorder(
+        self, W: Tensor, H: Tensor
+    ) -> tuple[Tensor, Tensor, Optional[Tensor]]:
+        if not self.config.actorder:
+            return W, H, None
+
+        perm = torch.argsort(torch.diag(H), descending=True)
+        W = W[:, perm]
+        H = H[perm][:, perm]
+        return W, H, perm
+
+    @torch.no_grad()
+    def _invert_hessian(self, H: Tensor) -> Tensor:
+        # prototype: 안정성 위해 cholesky_inverse 사용
+        L = torch.linalg.cholesky(H)
+        Hinv = torch.cholesky_inverse(L)
+        return Hinv
+
+    @torch.no_grad()
+    def _quantize_block(
+        self,
+        W: Tensor,
+        Hinv: Tensor,
+        col_start: int,
+        col_end: int,
+        quantizer: SimpleQuantizer,
+        group_size: int,
+    ) -> Tuple[Tensor, Tensor]:
+        """
+        W: 작업용 weight [out, in]
+        Hinv: inverse Hessian [in, in]
+        [col_start:col_end) 범위를 순차 양자화
+        반환:
+            Q_block: 양자화된 결과
+            Err_block: 오차 행렬
+        """
+        width = col_end - col_start
+        Q_block = torch.zeros((self.rows, width), dtype=W.dtype, device=W.device)
+        Err_block = torch.zeros((self.rows, width), dtype=torch.float32, device=W.device)
+
+        for local_j, j in enumerate(range(col_start, col_end)):
+            w = W[:, j].clone()  # [out]
+
+            # group별 quant params
+            if group_size == -1:
+                g0, g1 = col_start, col_end
+            else:
+                group_id = (j - col_start) // group_size
+                g0 = col_start + group_id * group_size
+                g1 = min(col_start + (group_id + 1) * group_size, col_end)
+
+            W_group = W[:, g0:g1]
+            scale, zero = quantizer.find_params(W_group)
+
+            q = quantizer.quantize(w.unsqueeze(1), scale, zero).squeeze(1)
+            Q_block[:, local_j] = q
+
+            d = Hinv[j, j]
+            err = (w - q).float() / float(d)
+            Err_block[:, local_j] = err
+
+            # 같은 block 내 뒤쪽 column에 오차 전파
+            if self.config.true_sequential and j + 1 < col_end:
+                W[:, j + 1 : col_end] -= err.unsqueeze(1) * Hinv[j, j + 1 : col_end].unsqueeze(0)
+
+        return Q_block, Err_block
+
+    @torch.no_grad()
+    def quantize(self) -> dict[str, Tensor]:
+        """
+        결과:
+            {
+                "qweight": ...,
+                "scale": ...,
+                "zero": ...,
+                "g_idx": ...,
+                "perm": ...,
+                "orig_dtype": ...,
+            }
+        prototype라서 저장 포맷은 단순화함.
+        """
+        W = self.weight.float().clone()
+        H = self._prepare_hessian()
+        W, H, perm = self._maybe_actorder(W, H)
+        Hinv = self._invert_hessian(H)
+
+        quantizer = SimpleQuantizer(bits=self.config.bits, sym=self.config.sym)
+
+        blocksize = self.config.blocksize
+        group_size = self.config.group_size
+
+        Q = torch.zeros_like(W)
+        all_scales: List[Tensor] = []
+        all_zeros: List[Tensor] = []
+        g_idx = []
+
+        for i in range(0, self.columns, blocksize):
+            i2 = min(i + blocksize, self.columns)
+
+            # 이 block 자체를 양자화
+            Q_block, Err_block = self._quantize_block(
+                W=W,
+                Hinv=Hinv,
+                col_start=i,
+                col_end=i2,
+                quantizer=quantizer,
+                group_size=group_size,
+            )
+            Q[:, i:i2] = Q_block
+
+            # block 바깥으로 오차 전파
+            if i2 < self.columns:
+                W[:, i2:] -= Err_block @ Hinv[i:i2, i2:]
+
+            # 저장용 scale/zero 재계산
+            if group_size == -1:
+                scale, zero = quantizer.find_params(Q[:, i:i2])
+                all_scales.append(scale)
+                all_zeros.append(zero)
+                g_idx.extend([len(all_scales) - 1] * (i2 - i))
+            else:
+                for g0 in range(i, i2, group_size):
+                    g1 = min(g0 + group_size, i2)
+                    scale, zero = quantizer.find_params(Q[:, g0:g1])
+                    all_scales.append(scale)
+                    all_zeros.append(zero)
+                    g_idx.extend([len(all_scales) - 1] * (g1 - g0))
+
+        # actorder였으면 원래 column 순서로 되돌림
+        invperm = None
+        if perm is not None:
+            invperm = torch.argsort(perm)
+            Q = Q[:, invperm]
+            g_idx = [g_idx[int(p)] for p in invperm.tolist()]
+
+        scale = torch.cat(all_scales, dim=1) if all_scales else torch.empty(0, device=self.device)
+        zero = torch.cat(all_zeros, dim=1) if all_zeros else torch.empty(0, device=self.device)
+
+        # 실제 int 저장용으로 정수화
+        # prototype에선 "dequantized weight Q"를 먼저 반환
+        # 원하면 여기서 qweight로 pack 가능
+        return {
+            "dequant_weight": Q.to(self.weight.dtype).contiguous(),
+            "scale": scale.contiguous(),
+            "zero": zero.contiguous(),
+            "g_idx": torch.tensor(g_idx, dtype=torch.int32, device=self.device),
+            "perm": perm if perm is not None else torch.empty(0, dtype=torch.int64, device=self.device),
+            "orig_dtype": torch.tensor([0], device=self.device),  # placeholder
+        }
+
+@torch.no_grad()
+def gpt_forward_hidden(model: nn.Module, input_ids: Tensor) -> Tensor:
+    """
+    네 GPT 클래스 구조를 그대로 따라간 calibration 전용 forward.
+    DDP/compiled wrapper 말고 base_model 기준 사용 추천.
+    """
+    x = model.tok_emb(input_ids)
+    x = torch.nn.functional.rms_norm(x, (x.size(-1),))
+    x0 = x
+    skips = []
+
+    for i in range(model.num_encoder_layers):
+        x = model.blocks[i](x, x0)
+        skips.append(x)
+
+    for i in range(model.num_decoder_layers):
+        if skips:
+            x = x + model.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
+        x = model.blocks[model.num_encoder_layers + i](x, x0)
+
+    x = model.final_norm(x)
+    return x
+
+def is_quant_target(name: str, module: nn.Module, config: GPTQConfig) -> bool:
+    if not hasattr(module, "weight"):
+        return False
+    if not isinstance(module, nn.Linear):
+        return False
+    if module.weight.ndim != 2:
+        return False
+    if any(p in name for p in config.keep_fp32_names):
+        return False
+    if module.weight.numel() <= config.max_passthrough_numel:
+        return False
+    return True
+
+
+def find_gptq_layers(model: nn.Module, config: GPTQConfig) -> dict[str, nn.Module]:
+    out = {}
+    for name, module in model.named_modules():
+        if is_quant_target(name, module, config):
+            out[name] = module
+    return out
+
+
+class GPTQRunner:
+    def __init__(self, model: nn.Module, config: GPTQConfig):
+        self.model = model
+        self.config = config
+        self.layers = find_gptq_layers(model, config)
+        self.quantizers: dict[str, GPTQLayerQuantizer] = {
+            name: GPTQLayerQuantizer(layer, config)
+            for name, layer in self.layers.items()
+        }
+
+    @torch.no_grad()
+    def collect_statistics(self, calibration_batches: list[Tensor]) -> None:
+        hooks = []
+
+        for name, layer in self.layers.items():
+            quantizer = self.quantizers[name]
+
+            def make_hook(qobj: GPTQLayerQuantizer):
+                def hook(module, inp, out):
+                    qobj.add_batch(inp[0].detach())
+                return hook
+
+            hooks.append(layer.register_forward_hook(make_hook(quantizer)))
+
+        was_training = self.model.training
+        self.model.eval()
+
+        for x in calibration_batches:
+            _ = gpt_forward_hidden(self.model, x)
+
+        for h in hooks:
+            h.remove()
+
+        if was_training:
+            self.model.train()
+
+    @torch.no_grad()
+    def quantize_model(self) -> dict[str, dict[str, Tensor]]:
+        result = {}
+        for name, q in self.quantizers.items():
+            result[name] = q.quantize()
+        return result
+
+    @torch.no_grad()
+    def apply_quantized_weights_inplace(self, quant_result: dict[str, dict[str, Tensor]]) -> None:
+        """
+        prototype:
+        실제 pack된 qweight를 넣는 대신 dequantized weight를 레이어에 바로 반영.
+        먼저 정확도 확인용으로 좋음.
+        """
+        module_dict = dict(self.model.named_modules())
+        for name, payload in quant_result.items():
+            layer = module_dict[name]
+            Wq = payload["dequant_weight"].to(device=layer.weight.device, dtype=layer.weight.dtype)
+            layer.weight.data.copy_(Wq)
+
+@torch.no_grad()
+def build_calibration_batches(
+    train_loader,
+    args,
+    grad_accum_steps: int,
+    num_batches: int = 16,
+) -> list[Tensor]:
+    xs = []
+    for _ in range(num_batches):
+        x, _ = train_loader.next_batch(
+            args.train_batch_tokens,
+            args.train_seq_len,
+            grad_accum_steps,
+        )
+        xs.append(x)
+    return xs
+
+
+@torch.no_grad()
+def run_gptq_prototype(
+    base_model: nn.Module,
+    train_loader,
+    args,
+    grad_accum_steps: int,
+    num_calib_batches: int = 16,
+    bits: int = 4,
+    blocksize: int = 128,
+    group_size: int = 128,
+) -> tuple[dict[str, dict[str, Tensor]], GPTQRunner]:
+    cfg = GPTQConfig(
+        bits=bits,
+        blocksize=blocksize,
+        group_size=group_size,
+        sym=True,
+        actorder=False,
+        true_sequential=True,
+    )
+
+    runner = GPTQRunner(base_model, cfg)
+    calib_batches = build_calibration_batches(
+        train_loader=train_loader,
+        args=args,
+        grad_accum_steps=grad_accum_steps,
+        num_batches=num_calib_batches,
+    )
+    runner.collect_statistics(calib_batches)
+    quant_result = runner.quantize_model()
+    return quant_result, runner
 # -----------------------------
 # DATA LOADING 
 # -----------------------------
@@ -1073,6 +1497,28 @@ def main() -> None:
         log0(f"Code size: {code_bytes} bytes")
         log0(f"Total submission size: {model_bytes + code_bytes} bytes")
 
+    # -----------------------------
+    # GPTQ 적용 단계 추가
+    # -----------------------------
+    if master_process:
+        quant_result, gptq_runner = run_gptq_prototype(
+            base_model=base_model,
+            train_loader=train_loader,
+            args=args,
+            grad_accum_steps=grad_accum_steps,
+            num_calib_batches=16,
+            bits=4,
+            blocksize=128,
+            group_size=128,
+        )
+
+        # GPTQ 결과를 모델 weight에 반영
+        gptq_runner.apply_quantized_weights_inplace(quant_result)
+
+    if distributed:
+        dist.barrier()
+
+    # 이제 바뀐 weight를 기존 serializer로 저장
     quant_obj, quant_stats = quantize_state_dict_int8(base_model.state_dict())
     quant_buf = io.BytesIO()
     torch.save(quant_obj, quant_buf)
