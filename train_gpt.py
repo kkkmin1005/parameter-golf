@@ -1519,9 +1519,17 @@ def main() -> None:
         dist.barrier()
 
     # 이제 바뀐 weight를 기존 serializer로 저장
-    quant_obj, quant_stats = quantize_state_dict_int8(base_model.state_dict())
+    skip_int8_requant = bool(int(os.environ.get("SKIP_INT8_REQUANT", "1")))
+    state_to_serialize: dict[str, object]
+    quant_stats: dict[str, object] | None = None
+    if skip_int8_requant:
+        log0("int8_requant:skipped reason=gptq_applied")
+        state_to_serialize = base_model.state_dict()
+    else:
+        state_to_serialize, quant_stats = quantize_state_dict_int8(base_model.state_dict())
+
     quant_buf = io.BytesIO()
-    torch.save(quant_obj, quant_buf)
+    torch.save(state_to_serialize, quant_buf)
     quant_raw = quant_buf.getvalue()
     quant_blob = zlib.compress(quant_raw, level=9)
     quant_raw_bytes = len(quant_raw)
@@ -1530,11 +1538,17 @@ def main() -> None:
             f.write(quant_blob)
         quant_file_bytes = os.path.getsize("final_model.int8.ptz")
         code_bytes = len(code.encode("utf-8"))
-        ratio = quant_stats["baseline_tensor_bytes"] / max(quant_stats["int8_payload_bytes"], 1)
-        log0(
-            f"Serialized model int8+zlib: {quant_file_bytes} bytes "
-            f"(payload:{quant_stats['int8_payload_bytes']} raw_torch:{quant_raw_bytes} payload_ratio:{ratio:.2f}x)"
-        )
+        if quant_stats is not None:
+            ratio = quant_stats["baseline_tensor_bytes"] / max(quant_stats["int8_payload_bytes"], 1)
+            log0(
+                f"Serialized model int8+zlib: {quant_file_bytes} bytes "
+                f"(payload:{quant_stats['int8_payload_bytes']} raw_torch:{quant_raw_bytes} payload_ratio:{ratio:.2f}x)"
+            )
+        else:
+            log0(
+                f"Serialized model (no extra int8 requant) zlib: {quant_file_bytes} bytes "
+                f"(raw_torch:{quant_raw_bytes})"
+            )
         log0(f"Total submission size int8+zlib: {quant_file_bytes + code_bytes} bytes")
 
     if distributed:
@@ -1542,7 +1556,11 @@ def main() -> None:
     with open("final_model.int8.ptz", "rb") as f:
         quant_blob_disk = f.read()
     quant_state = torch.load(io.BytesIO(zlib.decompress(quant_blob_disk)), map_location="cpu")
-    base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
+    if skip_int8_requant:
+        restored_state = quant_state
+    else:
+        restored_state = dequantize_state_dict_int8(quant_state)
+    base_model.load_state_dict(restored_state, strict=True)
     torch.cuda.synchronize()
     t_qeval = time.perf_counter()
     q_val_loss, q_val_bpb = eval_val(
